@@ -26,7 +26,7 @@
           containers: [
             containerTemplate(
               name: 'jnlp',
-              image: ':stage',
+              image: 'worker-image:latest',
               alwaysPullImage: true,
               ttyEnabled: true,
               // execute entrypoint from slave image
