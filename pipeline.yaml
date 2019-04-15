@@ -1,0 +1,57 @@
+- project:
+    name: pipeline-throttle
+
+    jobs:
+      - "pipeline-throttle":
+
+- job-template:
+    name: "pipeline-throttle"
+    project-type: pipeline
+    concurrent: true
+    properties:
+      - throttle:
+          max-total: 5
+          option: project
+    description: |
+        Example pipeline using JMS CI trigger, podTemplate and throttling
+    dsl: |
+      def label = "{name}"
+
+      timeout(time: 20, unit: 'MINUTES') {{
+        podTemplate(
+          name: '{name}',
+          label: label,
+          cloud: 'openshift',
+          idleMinutes: 1,
+          containers: [
+            containerTemplate(
+              name: 'jnlp',
+              image: ':stage',
+              alwaysPullImage: true,
+              ttyEnabled: true,
+              // execute entrypoint from slave image
+              command: '',
+              args: '',
+              resourceRequestMemory: '256Mi',
+              resourceLimitMemory: '768Mi',
+              resourceRequestCpu: '100m',
+              resourceLimitCpu: '200m'
+            ),
+          ]
+        ){{
+            node(label) {{
+              timestamps {{
+                stage('Show AMQ MESSAGE') {{
+                    sh '''
+                        echo $CI_MESSAGE
+                      '''
+                  }}
+              }}
+            }}
+          }}
+        }}
+    triggers:
+        - ci-trigger:
+            override-topic: Consumer.amq-client.prod.VirtualTopic.service.event.>
+            jms-selector: "method = 'important'"
+

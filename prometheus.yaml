@@ -1,0 +1,461 @@
+---
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: prometheus
+  annotations:
+    openshift.io/display-name: Prometheus
+    tags: "quickstart,monitoring,prometheus,alerts"
+    template.openshift.io/bindable: "false"
+    description: Prometheus w/ Alerts deployment
+  labels:
+    template: prometheus
+    app: prometheus
+parameters:
+- description: The namespace to instantiate prometheus under.
+  name: NAMESPACE
+  required: true
+- description: The location of the proxy image
+  name: IMAGE_PROXY
+  value: openshift/oauth-proxy:v1.0.0
+- description: The location of the prometheus image
+  name: IMAGE_PROMETHEUS
+  value: openshift/prometheus:v2.5.0
+- description: The location of the alertmanager image
+  name: IMAGE_ALERTMANAGER
+  value: openshift/prometheus-alertmanager:v0.9.1
+- description: The location of alert-buffer image
+  name: IMAGE_ALERT_BUFFER
+  value: openshift/prometheus-alert-buffer:v0.0.2
+- description: The session secret for the proxy
+  name: SESSION_SECRET
+  generate: expression
+  from: "[a-zA-Z0-9]{43}"
+- desription: Jenkins user with access to monitoring
+  name: JENKINS_USER
+  required: true
+- desription: Jenkins password for user with access to monitoring
+  name: JENKINS_PASS
+  required: true
+- desription: Jenkins hostname to be monitored
+  name: JENKINS_HOST
+  required: true
+- desription: Jenkins env name
+  name: ENV
+  required: true
+objects:
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: prometheus
+    namespace: "${NAMESPACE}"
+    labels:
+      template: prometheus
+      app: prometheus
+
+    annotations:
+      serviceaccounts.openshift.io/oauth-redirectreference.prom: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"prometheus"}}'
+      serviceaccounts.openshift.io/oauth-redirectreference.alerts: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"alerts"}}'
+- apiVersion: authorization.openshift.io/v1
+  kind: RoleBinding
+  metadata:
+    name: prometheus-viewer
+    labels:
+      template: prometheus
+      app: prometheus
+  roleRef:
+    name: view
+  subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: "${NAMESPACE}"
+- apiVersion: route.openshift.io/v1
+  kind: Route
+  metadata:
+    name: prometheus
+    namespace: "${NAMESPACE}"
+    labels:
+      template: prometheus
+      app: prometheus
+  spec:
+    to:
+      name: prometheus
+    port:
+      targetPort: prometheus-https
+    tls:
+      termination: Reencrypt
+      insecureEdgeTerminationPolicy: Redirect
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/scheme: https
+      service.alpha.openshift.io/serving-cert-secret-name: prometheus-tls
+    name: prometheus
+    namespace: "${NAMESPACE}"
+    labels:
+      template: prometheus
+      app: prometheus
+  spec:
+    ports:
+    - name: prometheus-https
+      port: 443
+      protocol: TCP
+      targetPort: 8443
+    - name: prometheus-http
+      port: 9090
+      protocol: TCP
+      targetPort: 9090
+    selector:
+      app: prometheus
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: prometheus-proxy
+    namespace: "${NAMESPACE}"
+    labels:
+      template: prometheus
+      app: prometheus
+  stringData:
+    session_secret: "${SESSION_SECRET}="
+- apiVersion: apps/v1beta1
+  kind: StatefulSet
+  metadata:
+    name: prometheus
+    namespace: "${NAMESPACE}"
+    labels:
+      template: prometheus
+      app: prometheus
+  spec:
+    updateStrategy:
+      type: RollingUpdate
+    podManagementPolicy: Parallel
+    selector:
+      matchLabels:
+        app: prometheus
+    template:
+      metadata:
+        labels:
+          app: prometheus
+        name: prometheus
+      spec:
+        serviceAccountName: prometheus
+        containers:
+        - name: oauth-proxy
+          image: ${IMAGE_PROXY}
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: '50m'
+              memory: '100Mi'
+            limits:
+              cpu: "100m"
+              memory: "200Mi"
+          ports:
+          - containerPort: 8443
+            name: web
+          args:
+          - -provider=openshift
+          - -https-address=:8443
+          - -http-address=
+          - -email-domain=*
+          - -upstream=http://localhost:9090
+          - -client-id=system:serviceaccount:${NAMESPACE}:prometheus
+          - -openshift-ca=/etc/pki/tls/cert.pem
+          - -openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          - '-openshift-sar={"resource": "namespaces", "verb": "get", "resourceName": "${NAMESPACE}", "namespace": "${NAMESPACE}"}'
+          - -tls-cert=/etc/tls/private/tls.crt
+          - -tls-key=/etc/tls/private/tls.key
+          - -client-secret-file=/var/run/secrets/kubernetes.io/serviceaccount/token
+          - -cookie-secret-file=/etc/proxy/secrets/session_secret
+          - -skip-auth-regex=^/metrics
+          volumeMounts:
+          - mountPath: /etc/tls/private
+            name: prometheus-tls
+          - mountPath: /etc/proxy/secrets
+            name: prometheus-secrets
+          - mountPath: /prometheus
+            name: prometheus-data
+ 
+        - name: prometheus
+          resources:
+            requests:
+              cpu: '200m'
+              memory: '512Mi'
+            limits:
+              cpu: "400m"
+              memory: "1024Mi"
+          ports:
+          - containerPort: 9090
+            name: prometheus
+          args:
+          - --storage.tsdb.retention=5d
+          - --storage.tsdb.min-block-duration=2m
+          - --config.file=/etc/prometheus/prometheus.yml
+          - --web.enable-lifecycle
+          image: ${IMAGE_PROMETHEUS}
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+          - mountPath: /etc/prometheus
+            name: prometheus-config
+          - mountPath: /prometheus
+            name: prometheus-data
+ 
+        - name: alerts-proxy
+          image: ${IMAGE_PROXY}
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "100Mi"
+            limits:
+              cpu: "100m"
+              memory: "200Mi"
+          ports:
+          - containerPort: 9443
+            name: web
+          args:
+          - -provider=openshift
+          - -https-address=:9443
+          - -http-address=
+          - -email-domain=*
+          - -upstream=http://localhost:9099
+          - -client-id=system:serviceaccount:${NAMESPACE}:prometheus
+          - -openshift-ca=/etc/pki/tls/cert.pem
+          - -openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          - '-openshift-sar={"resource": "namespaces", "verb": "get", "resourceName": "${NAMESPACE}", "namespace": "${NAMESPACE}"}'
+          - -tls-cert=/etc/tls/private/tls.crt
+          - -tls-key=/etc/tls/private/tls.key
+          - -client-secret-file=/var/run/secrets/kubernetes.io/serviceaccount/token
+          - -cookie-secret-file=/etc/proxy/secrets/session_secret
+          - -skip-auth-regex=^/metrics
+          volumeMounts:
+          - mountPath: /etc/tls/private
+            name: alerts-tls
+          - mountPath: /etc/proxy/secrets
+            name: alerts-secrets
+ 
+        - name: alert-buffer
+          args:
+          - --storage-path=/alert-buffer/messages.db
+          image: ${IMAGE_ALERT_BUFFER}
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "100Mi"
+            limits:
+              cpu: "100m"
+              memory: "200Mi"
+          volumeMounts:
+          - mountPath: /alert-buffer
+            name: alert-buffer-data
+          ports:
+          - containerPort: 9099
+            name: alert-buf
+ 
+        - name: alertmanager
+          args:
+          - -config.file=/etc/alertmanager/alertmanager.yml
+          image: ${IMAGE_ALERTMANAGER}
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "100Mi"
+            limits:
+              cpu: "200m"
+              memory: "200Mi"
+          ports:
+          - containerPort: 9093
+            name: web
+          volumeMounts:
+          - mountPath: /etc/alertmanager
+            name: alertmanager-config
+          - mountPath: /alertmanager
+            name: alertmanager-data
+ 
+        restartPolicy: Always
+        volumes:
+        - name: prometheus-config
+          secret:
+            defaultMode: 420
+            secretName: prometheus-config
+        - name: prometheus-secrets
+          secret:
+            secretName: prometheus-proxy
+        - name: prometheus-tls
+          secret:
+            secretName: prometheus-tls
+        - name: prometheus-data
+          emptyDir: {}
+        - name: alertmanager-config
+          secret:
+            defaultMode: 420
+            secretName: prometheus-alerts
+        - name: alerts-secrets
+          secret:
+            secretName: alerts-proxy
+        - name: alerts-tls
+          secret:
+            secretName: prometheus-alerts-tls
+        - name: alertmanager-data
+          emptyDir: {}
+        - name: alert-buffer-data
+          emptyDir: {}
+ 
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: prometheus-config
+    namespace: "${NAMESPACE}"
+    labels:
+      template: prometheus
+      app: prometheus
+  stringData:
+    prometheus.rules: |
+      groups:
+      - name: jenkins-rules
+        interval: 30s # defaults to global interval
+        rules:
+        - alert: JenkinsDown
+          expr: up{job="jenkins"} == 0
+          for: 2m
+          annotations:
+            summary: "[${ENV}] Jenkins monitoring endpoind down"
+            description: "${ENV} Unable to scrape metrics from Jenkins"
+
+        - alert: HighCPU
+          expr: javamelody_system_cpu_load_pct > 30
+          for: 30m
+          annotations:
+            summary: "[${ENV}] High CPU usage on jenkins master"
+            description: "${ENV} jenkins has CPU usage over 30% for 30 minutes(current value: {{ $value }})"
+
+        - alert: HighMemoryUsage
+          expr: javamelody_memory_used_pct > 90
+          for: 10m
+          annotations:
+            summary: "[${ENV}] High memory usage on jenkins master"
+            description: "${ENV} jenkins has memory usage over 90% for 10 minutes(current value: {{ $value }})"
+
+    prometheus.yml: |
+      rule_files:
+        - 'prometheus.rules'
+ 
+      # A scrape configuration for running Prometheus on a Kubernetes cluster.
+      # This uses separate scrape configs for cluster components (i.e. API server, node)
+      # and services to allow each to use different authentication configs.
+      #
+      # Kubernetes labels will be added as Prometheus labels on metrics via the
+      # `labelmap` relabeling action.
+ 
+      # Scrape config for API servers.
+      #
+      # Kubernetes exposes API servers as endpoints to the default/kubernetes
+      # service so this uses `endpoints` role and uses relabelling to only keep
+      # the endpoints associated with the default/kubernetes service using the
+      # default named port `https`. This works for single API server deployments as
+      # well as HA API server deployments.
+      scrape_configs:
+      - job_name: 'jenkins'
+      
+        scheme: https
+        metrics_path: '/monitoring'
+        tls_config:
+          ca_file: /etc/pki/tls/redhat/ca.crt
+      
+        basic_auth:
+          username: ${JENKINS_USER}
+          password: ${JENKINS_PASS}
+        params:
+          format: ['prometheus']
+      
+        scrape_interval: 30s
+      
+        static_configs:
+          - targets: ['${JENKINS_HOST}']
+            labels:
+              env: '${ENV}'
+
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+      
+      alerting:
+        alertmanagers:
+        - scheme: http
+          static_configs:
+          - targets:
+            - "localhost:9093"
+ 
+ 
+- apiVersion: route.openshift.io/v1
+  kind: Route
+  metadata:
+    name: alerts
+    namespace: "${NAMESPACE}"
+    labels:
+      template: prometheus
+      app: prometheus
+  spec:
+    to:
+      name: alerts
+    tls:
+      termination: Reencrypt
+      insecureEdgeTerminationPolicy: Redirect
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      service.alpha.openshift.io/serving-cert-secret-name: prometheus-alerts-tls
+    labels:
+      name: alerts
+      template: prometheus
+      app: prometheus
+    name: alerts
+    namespace: "${NAMESPACE}"
+  spec:
+    ports:
+    - name: alerts
+      port: 443
+      protocol: TCP
+      targetPort: 9443
+    selector:
+      app: prometheus
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: alerts-proxy
+    namespace: "${NAMESPACE}"
+    labels:
+      template: prometheus
+      app: prometheus
+  stringData:
+    session_secret: "${SESSION_SECRET}="
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: prometheus-alerts
+    namespace: "${NAMESPACE}"
+    labels:
+      template: prometheus
+      app: prometheus
+  stringData:
+    alertmanager.yml: |
+      global:
+        smtp_smarthost: <mail-host>
+        smtp_from: prometheus-jenkins@yourdomain.com
+        smtp_require_tls: true
+ 
+      route:
+        receiver: alert-email
+        repeat_interval: 3h
+        group_by: []
+ 
+      receivers:
+      - name: alert-email
+        email_configs:
+          - to: jenkins-alerts@yourdomain.com
+            send_resolved: true
